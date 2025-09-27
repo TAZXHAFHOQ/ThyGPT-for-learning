@@ -3,7 +3,6 @@ import io
 import csv
 import json
 import base64
-import tempfile
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -38,7 +37,7 @@ with st.sidebar:
         index=0,
     )
 
-    # Generic model box (used for non-Vertex providers; Vertex uses fixed IDs)
+    # Suggested defaults
     default_model = (
         "gpt-4o-mini" if provider == "OpenAI"
         else "gemini-2.0-flash" if provider.startswith("Google")
@@ -51,7 +50,7 @@ with st.sidebar:
                           help="For Vertex options this is pre-filled to the recommended ID.")
 
     st.divider()
-    st.header("API Keys")
+    st.header("API Keys (non-Vertex providers)")
     openai_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...", disabled=provider!="OpenAI")
     google_key = st.text_input("Google (Gemini) API Key", type="password", placeholder="AIza...", disabled=not provider.startswith("Google"))
     anthropic_key = st.text_input("Anthropic API Key", type="password", placeholder="sk-ant-...", disabled=provider!="Anthropic")
@@ -62,10 +61,13 @@ with st.sidebar:
         st.header("Vertex AI Settings")
         gcp_project = st.text_input("GCP Project ID", placeholder="your-gcp-project")
         gcp_location = st.text_input("Location", value="us-east5")
-        use_vertex_sa = st.checkbox("Use Service Account JSON", value=True,
-                                    help="If unchecked, the app relies on Application Default Credentials on the host.")
-        sa_json = st.text_area("Service Account JSON (paste full JSON)", height=140, disabled=not use_vertex_sa,
-                               help="Optional if ADC is already configured on the server.")
+
+        use_vertex_sa = st.checkbox(
+            "Use Service Account JSON file",
+            value=True,
+            help="If unchecked, the app relies on Application Default Credentials on the host."
+        )
+        sa_file = st.file_uploader("Upload Service Account JSON", type=["json"], disabled=not use_vertex_sa)
 
     st.divider()
     st.header("Risk Thresholds")
@@ -176,13 +178,33 @@ def management_recommendation(prob: Optional[float], low: float, high: float) ->
         return "H-PPV bucket: if radiologist concurs, consider escalating (e.g., surgery) without FNA."
     return "Moderately suspicious: consider FNA per ACR TI-RADS and clinical factors."
 
-def _maybe_write_sa_json(json_text: str) -> Optional[str]:
-    if not json_text or not json_text.strip():
-        return None
-    fd, path = tempfile.mkstemp(prefix="gcp-key-", suffix=".json")
-    os.write(fd, json_text.encode("utf-8"))
-    os.close(fd)
-    return path
+# ---------- Service Account JSON handling (upload file) ----------
+def _load_sa_json_from_upload(sa_file) -> (Optional[Dict[str, Any]], Optional[str]):
+    if sa_file is None:
+        return None, "No service account JSON file uploaded."
+    try:
+        # Reset pointer if the file-like object was read earlier
+        sa_file.seek(0)
+        sa_dict = json.load(sa_file)
+        return sa_dict, None
+    except Exception as e:
+        return None, f"Failed to parse service account JSON: {e}"
+
+def _build_vertex_credentials_from_dict(sa_dict: Optional[Dict[str, Any]]):
+    try:
+        from google.oauth2 import service_account
+    except Exception as e:
+        return None, f"google-auth not available: {e}"
+    if not sa_dict:
+        return None, "No service account JSON provided."
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            sa_dict,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return creds, None
+    except Exception as e:
+        return None, f"Failed to build credentials: {e}"
 
 # ================== PROVIDER CALLS ==================
 def call_openai_vision(model: str, b64_png: str, user_prompt: str) -> str:
@@ -236,22 +258,24 @@ def call_anthropic_vision(model: str, b64_png: str, user_prompt: str) -> str:
 
 def call_vertex_llama_maverick(model_id: str, b64_png: str, user_prompt: str,
                                project: str, location: str,
-                               sa_json_text: Optional[str], use_sa: bool) -> str:
+                               sa_dict: Optional[Dict[str, Any]], use_sa: bool) -> str:
     """
-    Vertex AI Llama 4 Maverick (multimodal): accepts image+text.
+    Vertex AI Llama 4 Maverick (multimodal): image+text.
+    Uses explicit SA credentials (uploaded file) to avoid metadata lookups.
     """
     try:
-        if use_sa and sa_json_text and sa_json_text.strip():
-            key_path = _maybe_write_sa_json(sa_json_text)
-            if key_path:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
-
         import vertexai
         from vertexai.generative_models import GenerativeModel, Part, GenerationConfig
 
-        vertexai.init(project=project, location=location)
+        creds = None
+        if use_sa:
+            creds, err = _build_vertex_credentials_from_dict(sa_dict)
+            if err:
+                return f"__ERROR__ {err}"
 
-        model = GenerativeModel(model_id)
+        vertexai.init(project=project, location=location, credentials=creds)
+        model = GenerativeModel(model_id or "llama-4-maverick-17b-128e-instruct-maas")
+
         img_part = Part.from_data(mime_type="image/png", data=base64.b64decode(b64_png))
         gen_cfg = GenerationConfig(temperature=0.1)
 
@@ -259,33 +283,36 @@ def call_vertex_llama_maverick(model_id: str, b64_png: str, user_prompt: str,
                                           generation_config=gen_cfg,
                                           safety_settings=None)
         return (getattr(response, "text", None) or str(response)).strip()
+
     except Exception as e:
         return f"__ERROR__ {e}"
 
 def call_vertex_llama_scout(model_id: str, text_payload: str,
                             project: str, location: str,
-                            sa_json_text: Optional[str], use_sa: bool) -> str:
+                            sa_dict: Optional[Dict[str, Any]], use_sa: bool) -> str:
     """
-    Vertex AI Llama 4 Scout (long-context): optimized for long text reading / reasoning.
-    This call is TEXT-ONLY. Use for report checking or Q&A. (Images are ignored here.)
+    Vertex AI Llama 4 Scout (text-only long-context).
+    Uses explicit SA credentials (uploaded file) to avoid metadata lookups.
     """
     try:
-        if use_sa and sa_json_text and sa_json_text.strip():
-            key_path = _maybe_write_sa_json(sa_json_text)
-            if key_path:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
-
         import vertexai
         from vertexai.generative_models import GenerativeModel, GenerationConfig
 
-        vertexai.init(project=project, location=location)
-        model = GenerativeModel(model_id)
+        creds = None
+        if use_sa:
+            creds, err = _build_vertex_credentials_from_dict(sa_dict)
+            if err:
+                return f"__ERROR__ {err}"
+
+        vertexai.init(project=project, location=location, credentials=creds)
+        model = GenerativeModel(model_id or "llama-4-scout-405b-instruct-maas")
         gen_cfg = GenerationConfig(temperature=0.1)
 
         response = model.generate_content([text_payload],
                                           generation_config=gen_cfg,
                                           safety_settings=None)
         return (getattr(response, "text", None) or str(response)).strip()
+
     except Exception as e:
         return f"__ERROR__ {e}"
 
@@ -302,18 +329,18 @@ def call_provider(provider_name: str, model_id: str, b64_png: Optional[str], pro
                   # Vertex args (optional)
                   gcp_project: Optional[str] = None,
                   gcp_location: Optional[str] = None,
-                  sa_json_text: Optional[str] = None,
+                  sa_dict: Optional[Dict[str, Any]] = None,
                   use_sa: bool = False) -> str:
     """
     Unified provider dispatcher.
     For Scout (text-only), pass b64_png=None and prompt should contain the textual payload.
     """
     if provider_name == "OpenAI":
-        return call_openai_vision(model_id, b64_png, prompt)
+        return call_openai_vision(model_id, b64_png or "", prompt)
     elif provider_name.startswith("Google (Gemini)"):
-        return call_gemini_vision(model_id, b64_png, prompt)
+        return call_gemini_vision(model_id, b64_png or "", prompt)
     elif provider_name == "Anthropic":
-        return call_anthropic_vision(model_id, b64_png, prompt)
+        return call_anthropic_vision(model_id, b64_png or "", prompt)
     elif provider_name == "Vertex AI • Llama 4 Maverick (multimodal)":
         return call_vertex_llama_maverick(
             model_id=model_id or "llama-4-maverick-17b-128e-instruct-maas",
@@ -321,7 +348,7 @@ def call_provider(provider_name: str, model_id: str, b64_png: Optional[str], pro
             user_prompt=prompt,
             project=gcp_project or "",
             location=gcp_location or "us-east5",
-            sa_json_text=sa_json_text,
+            sa_dict=sa_dict,
             use_sa=use_sa
         )
     elif provider_name == "Vertex AI • Llama 4 Scout (long-context)":
@@ -330,11 +357,10 @@ def call_provider(provider_name: str, model_id: str, b64_png: Optional[str], pro
             text_payload=prompt,
             project=gcp_project or "",
             location=gcp_location or "us-east5",
-            sa_json_text=sa_json_text,
+            sa_dict=sa_dict,
             use_sa=use_sa
         )
     else:
-        # Local stub
         return run_local_model(base64.b64decode(b64_png) if b64_png else b"", prompt)
 
 # ================== UI: INPUTS ==================
@@ -361,9 +387,12 @@ def analyze_single_image(upfile) -> None:
     buf = io.BytesIO(); im.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    # For Scout (text-only), we generate a text payload that explains we have an image
-    # and ask it to reason generically (less accurate than Maverick).
+    if provider in ("OpenAI", "Google (Gemini)", "Anthropic"):
+        if not ensure_env_keys(provider):
+            return
+
     if provider == "Vertex AI • Llama 4 Scout (long-context)":
+        # TEXT-only route: will output conservative JSON with 'unknown' as needed
         text_payload = (
             "You are a radiology copilot. The user provided a thyroid ultrasound image "
             "but this model endpoint is optimized for long-text reading and may not parse images. "
@@ -375,16 +404,16 @@ def analyze_single_image(upfile) -> None:
             provider, model, None, text_payload,
             gcp_project=gcp_project if provider.startswith("Vertex") else None,
             gcp_location=gcp_location if provider.startswith("Vertex") else None,
-            sa_json_text=sa_json if provider.startswith("Vertex") else None,
-            use_sa=use_vertex_sa if provider.startswith("Vertex") else False
+            sa_dict=_load_sa_json_from_upload(sa_file)[0] if use_vertex_sa and provider.startswith("Vertex") else None,
+            use_sa=bool(use_vertex_sa and provider.startswith("Vertex"))
         )
     else:
         raw = call_provider(
             provider, model, b64, USER_PROMPT_TEMPLATE,
             gcp_project=gcp_project if provider.startswith("Vertex") else None,
             gcp_location=gcp_location if provider.startswith("Vertex") else None,
-            sa_json_text=sa_json if provider.startswith("Vertex") else None,
-            use_sa=use_vertex_sa if provider.startswith("Vertex") else False
+            sa_dict=_load_sa_json_from_upload(sa_file)[0] if use_vertex_sa and provider.startswith("Vertex") else None,
+            use_sa=bool(use_vertex_sa and provider.startswith("Vertex"))
         )
 
     parsed = parse_json_strict(raw)
@@ -405,7 +434,6 @@ def analyze_single_image(upfile) -> None:
         else:
             st.markdown("**Malignancy probability**: `unknown`")
         st.markdown(f"**Summary**: {summ or '—'}")
-
         st.info(management_recommendation(pr_val, low_thr, high_thr))
 
         with st.expander("Show structured JSON"):
@@ -426,37 +454,37 @@ if images:
             with st.spinner(f"Analyzing {up.name} with {provider} • {model} ..."):
                 analyze_single_image(up)
 
-# ================== REPORT CONSISTENCY CHECK (Scout excels here) ==================
+# ================== REPORT CONSISTENCY CHECK ==================
 if report_text and images:
     st.subheader("Report Error Check (optional)")
-    # Build text payload; for multimodal providers we still provide an image
     ref_up = images[0]
     im = Image.open(ref_up).convert("RGB")
     buf = io.BytesIO(); im.save(buf, format="PNG")
     b64_first = base64.b64encode(buf.getvalue()).decode("utf-8")
-
     templ = ERROR_CHECK_TEMPLATE + f'\n\nReport text:\n"""\n{report_text}\n"""'
 
+    if provider in ("OpenAI", "Google (Gemini)", "Anthropic"):
+        if not ensure_env_keys(provider):
+            st.stop()
+
     if provider == "Vertex AI • Llama 4 Scout (long-context)":
-        # TEXT ONLY: Give it the spec + report
         payload = "Long-context report consistency check:\n" + templ
         with st.spinner("Checking report for consistency (Vertex Llama 4 Scout)..."):
             raw_err = call_provider(
                 provider, model, None, payload,
                 gcp_project=gcp_project if provider.startswith("Vertex") else None,
                 gcp_location=gcp_location if provider.startswith("Vertex") else None,
-                sa_json_text=sa_json if provider.startswith("Vertex") else None,
-                use_sa=use_vertex_sa if provider.startswith("Vertex") else False
+                sa_dict=_load_sa_json_from_upload(sa_file)[0] if use_vertex_sa and provider.startswith("Vertex") else None,
+                use_sa=bool(use_vertex_sa and provider.startswith("Vertex"))
             )
     else:
-        # Multimodal-capable: include image
         with st.spinner(f"Checking report vs. image {ref_up.name} ..."):
             raw_err = call_provider(
                 provider, model, b64_first, templ,
                 gcp_project=gcp_project if provider.startswith("Vertex") else None,
                 gcp_location=gcp_location if provider.startswith("Vertex") else None,
-                sa_json_text=sa_json if provider.startswith("Vertex") else None,
-                use_sa=use_vertex_sa if provider.startswith("Vertex") else False
+                sa_dict=_load_sa_json_from_upload(sa_file)[0] if use_vertex_sa and provider.startswith("Vertex") else None,
+                use_sa=bool(use_vertex_sa and provider.startswith("Vertex"))
             )
 
     parsed_err = parse_json_strict(raw_err)
@@ -491,15 +519,19 @@ if ask_btn and user_q.strip():
                                   ensure_ascii=False)
         context_prompt = CHAT_PROMPT_WRAP.format(context_json=context_json, user_q=user_q)
 
-        # For Scout: augment with report_text to benefit long-context reading
+        if provider in ("OpenAI", "Google (Gemini)", "Anthropic"):
+            if not ensure_env_keys(provider):
+                st.stop()
+
+        # For Scout: include report_text to exploit long-context
         if provider == "Vertex AI • Llama 4 Scout (long-context)":
             payload = "Long-context Q&A.\n\n" + (f"Report text:\n{report_text}\n\n" if report_text else "") + context_prompt
             raw_ans = call_provider(
                 provider, model, None, payload,
                 gcp_project=gcp_project if provider.startswith("Vertex") else None,
                 gcp_location=gcp_location if provider.startswith("Vertex") else None,
-                sa_json_text=sa_json if provider.startswith("Vertex") else None,
-                use_sa=use_vertex_sa if provider.startswith("Vertex") else False
+                sa_dict=_load_sa_json_from_upload(sa_file)[0] if use_vertex_sa and provider.startswith("Vertex") else None,
+                use_sa=bool(use_vertex_sa and provider.startswith("Vertex"))
             )
         else:
             # Use last image for grounding if available
@@ -514,8 +546,8 @@ if ask_btn and user_q.strip():
                 provider, model, b64_last, context_prompt,
                 gcp_project=gcp_project if provider.startswith("Vertex") else None,
                 gcp_location=gcp_location if provider.startswith("Vertex") else None,
-                sa_json_text=sa_json if provider.startswith("Vertex") else None,
-                use_sa=use_vertex_sa if provider.startswith("Vertex") else False
+                sa_dict=_load_sa_json_from_upload(sa_file)[0] if use_vertex_sa and provider.startswith("Vertex") else None,
+                use_sa=bool(use_vertex_sa and provider.startswith("Vertex"))
             )
 
         st.session_state.chat_log.append(("you", user_q))
@@ -562,9 +594,9 @@ if enable_export and results:
     for r in results:
         rows.append([r.filename, r.ti_rads, "" if r.prob is None else r.prob, r.summary])
 
-    csv_bytes = io.StringIO()
-    w = csv.writer(csv_bytes)
+    csv_buf = io.StringIO()
+    w = csv.writer(csv_buf)
     w.writerows(rows)
-    st.download_button("Download CSV", csv_bytes.getvalue(), file_name="thyroid_results.csv", mime="text/csv")
+    st.download_button("Download CSV", csv_buf.getvalue(), file_name="thyroid_results.csv", mime="text/csv")
 
 st.caption("Based on an AIGC-CAD concept for thyroid US: image → LLM features → TI-RADS & malignancy probability → thresholded management. Research demo only.")
