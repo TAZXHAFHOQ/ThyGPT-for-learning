@@ -1,5 +1,10 @@
 streamlit>=1.36.0
 pillow>=10.4.0
+
+# Cloud LLM SDKs (optional unless you use that provider)
 openai>=1.40.0
 google-generativeai>=0.7.2
 anthropic>=0.34.0
+
+# Vertex AI (for Llama 4 Maverick / Scout)
+google-cloud-aiplatform>=1.64.0
