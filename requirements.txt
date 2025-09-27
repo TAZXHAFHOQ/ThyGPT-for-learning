@@ -1,0 +1,5 @@
+streamlit>=1.36.0
+pillow>=10.4.0
+openai>=1.40.0
+google-generativeai>=0.7.2
+anthropic>=0.34.0
