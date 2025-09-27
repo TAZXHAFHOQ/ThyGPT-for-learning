@@ -8,3 +8,5 @@ anthropic>=0.34.0
 
 # Vertex AI (for Llama 4 Maverick / Scout)
 google-cloud-aiplatform>=1.64.0
+# google-auth is a transitive dep, but we import from it directly:
+google-auth>=2.30.0
